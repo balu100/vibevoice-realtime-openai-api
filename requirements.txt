@@ -3,8 +3,8 @@
 
 # PyTorch with CUDA 13.0
 --extra-index-url https://download.pytorch.org/whl/cu130
-torch
-torchaudio
+torch==2.9.0
+torchaudio==2.9.0
 
 # VibeVoice from GitHub (pinned to specific commit)
 git+https://github.com/microsoft/VibeVoice.git@a507d67f8e78d9ff6b2ec0b79f1f43ad89477187

@@ -13,15 +13,13 @@ import argparse
 import copy
 import io
 import os
-import shutil
 import subprocess
-import threading
 import time
 import traceback
 import urllib.request
 from pathlib import Path
-from typing import Dict, List, Optional, Any, Iterator
-from contextlib import asynccontextmanager, nullcontext, redirect_stderr
+from typing import Dict, List, Optional, Any
+from contextlib import asynccontextmanager
 
 # Set HuggingFace cache BEFORE importing any HF libraries
 # Only use HF_HOME (TRANSFORMERS_CACHE is deprecated in v5)
@@ -32,7 +30,6 @@ os.environ["HF_HOME"] = str(MODELS_DIR / "huggingface")
 import numpy as np
 import torch
 from fastapi import FastAPI, HTTPException, Response
-from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 import uvicorn
 import scipy.io.wavfile as wavfile
@@ -44,7 +41,6 @@ from vibevoice.modular.modeling_vibevoice_streaming_inference import (
 from vibevoice.processor.vibevoice_streaming_processor import (
     VibeVoiceStreamingProcessor,
 )
-from vibevoice.modular.streamer import AudioStreamer
 
 # ------------------------------------------------------------------------------
 # Configuration
@@ -76,30 +72,15 @@ VOICE_BASE_URL = "https://github.com/microsoft/VibeVoice/raw/main/demo/voices/st
 # OpenAI voice name mapping to VibeVoice voices
 OPENAI_TO_VIBEVOICE_MAP = {
     "alloy": "Carter",
-    "ash": "Davis",
-    "ballad": "Emma",
-    "coral": "Grace",
     "echo": "Davis",
     "fable": "Emma",
-    "marin": "Grace",
     "onyx": "Frank",
     "nova": "Grace",
-    "sage": "Carter",
     "shimmer": "Mike",
-    "verse": "Frank",
 }
 
 # Supported audio formats
 SUPPORTED_FORMATS = ["mp3", "wav", "opus", "flac", "aac", "pcm"]
-STREAMABLE_FORMATS = ["mp3", "opus", "flac", "aac", "pcm"]
-
-# ffmpeg format mappings
-FFMPEG_FORMAT_ARGS = {
-    "mp3": ["-f", "mp3", "-codec:a", "libmp3lame", "-q:a", "2"],
-    "opus": ["-f", "opus", "-codec:a", "libopus"],
-    "flac": ["-f", "flac", "-codec:a", "flac"],
-    "aac": ["-f", "adts", "-codec:a", "aac"],
-}
 
 # ------------------------------------------------------------------------------
 # Model Download Utilities
@@ -137,7 +118,6 @@ class TTSRequest(BaseModel):
     input: str = Field(..., description="Text to synthesize", max_length=4096)
     voice: str = Field(default="Carter", description="Voice ID")
     model: str = Field(default="tts-1", description="Model ID (ignored, for compatibility)")
-    instructions: Optional[str] = Field(default=None, description="Voice instructions (ignored)")
     response_format: str = Field(default="mp3", description="Audio format")
     speed: float = Field(default=1.0, description="Speed (not yet supported)")
     stream: bool = Field(default=False, description="Enable streaming response")
@@ -179,27 +159,7 @@ class VibeVoiceTTSService:
         self.model: Optional[VibeVoiceStreamingForConditionalGenerationInference] = None
         self.voice_presets: Dict[str, Path] = {}
         self._voice_cache: Dict[str, Any] = {}
-        self.device = self._resolve_device(device)
-        self._torch_device = torch.device(self.device)
-
-    def _resolve_device(self, device: str) -> str:
-        """Resolve auto/cuda/mps/cpu to an available torch device."""
-        if device == "auto":
-            if torch.cuda.is_available():
-                return "cuda"
-            if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-                return "mps"
-            return "cpu"
-
-        if device == "cuda" and not torch.cuda.is_available():
-            print("[startup] CUDA requested but not available; falling back to CPU")
-            return "cpu"
-
-        if device == "mps" and not (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()):
-            print("[startup] MPS requested but not available; falling back to CPU")
-            return "cpu"
-
-        return device
+        self._torch_device = torch.device(device)
 
     def load(self) -> None:
         """Load model and voice presets"""
@@ -250,33 +210,11 @@ class VibeVoiceTTSService:
                 raise
 
         self.model.eval()
-        self._configure_noise_scheduler()
         self.model.set_ddpm_inference_steps(num_steps=5)
 
         # Load voice presets
         self._load_voice_presets()
-        if "Carter" in self.voice_presets:
-            self._get_voice_prompt("Carter")
         print(f"[startup] Model ready on {self.device}")
-
-    def _configure_noise_scheduler(self) -> None:
-        """Use the scheduler settings from the upstream realtime web demo when available."""
-        if not self.model or not hasattr(self.model, "model"):
-            return
-
-        model_core = self.model.model
-        scheduler = getattr(model_core, "noise_scheduler", None)
-        if scheduler is None or not hasattr(scheduler, "from_config"):
-            return
-
-        try:
-            model_core.noise_scheduler = scheduler.from_config(
-                scheduler.config,
-                algorithm_type="sde-dpmsolver++",
-                beta_schedule="squaredcos_cap_v2",
-            )
-        except Exception as e:
-            print(f"[startup] Could not apply realtime scheduler config: {e}")
 
     def _load_voice_presets(self) -> None:
         """Scan and load available voice presets"""
@@ -353,111 +291,6 @@ class VibeVoiceTTSService:
             )
         return self._voice_cache[voice]
 
-    def _prepare_inputs(self, text: str, prefilled_outputs: Any) -> Dict[str, Any]:
-        """Prepare model inputs and move tensors to the selected device."""
-        if not self.processor:
-            raise RuntimeError("Processor not loaded")
-
-        inputs = self.processor.process_input_with_cached_prompt(
-            text=text,
-            cached_prompt=prefilled_outputs,
-            padding=True,
-            return_tensors="pt",
-            return_attention_mask=True,
-        )
-
-        for k, v in inputs.items():
-            if torch.is_tensor(v):
-                inputs[k] = v.to(self._torch_device)
-
-        return inputs
-
-    def _sync_device_for_timing(self) -> None:
-        """Synchronize async accelerators so logged timing is meaningful."""
-        if self.device == "cuda":
-            torch.cuda.synchronize()
-
-    def _audio_to_numpy(self, audio: Any) -> np.ndarray:
-        """Convert model audio output or chunk to mono float32 numpy."""
-        if torch.is_tensor(audio):
-            audio = audio.detach().cpu().to(torch.float32).numpy()
-        else:
-            audio = np.asarray(audio, dtype=np.float32)
-
-        if audio.ndim > 1:
-            audio = audio.reshape(-1)
-
-        if audio.size:
-            peak = np.max(np.abs(audio))
-            if peak > 1.0:
-                audio = audio / peak
-
-        return audio.astype(np.float32, copy=False)
-
-    def _run_stream_generation(
-        self,
-        inputs: Dict[str, Any],
-        audio_streamer: AudioStreamer,
-        errors: List[BaseException],
-        cfg_scale: float,
-        prefilled_outputs: Any,
-        stop_event: threading.Event,
-    ) -> None:
-        """Run generation in a background thread and feed AudioStreamer."""
-        try:
-            progress_enabled = os.environ.get("VIBEVOICE_PROGRESS", "").lower() in {"1", "true", "yes"}
-            stderr_sink = nullcontext()
-            if not progress_enabled:
-                stderr_sink = open(os.devnull, "w", encoding="utf-8")
-
-            with stderr_sink as sink:
-                progress_context = nullcontext() if progress_enabled else redirect_stderr(sink)
-                with progress_context, torch.inference_mode():
-                    self.model.generate(
-                        **inputs,
-                        max_new_tokens=None,
-                        cfg_scale=cfg_scale,
-                        tokenizer=self.processor.tokenizer,
-                        generation_config={"do_sample": False},
-                        verbose=False,
-                        audio_streamer=audio_streamer,
-                        stop_check_fn=stop_event.is_set,
-                        refresh_negative=True,
-                        all_prefilled_outputs=copy.deepcopy(prefilled_outputs),
-                    )
-        except GeneratorExit:
-            raise
-        except BaseException as exc:
-            errors.append(exc)
-            traceback.print_exc()
-        finally:
-            audio_streamer.end()
-
-    def _run_full_generation(
-        self,
-        inputs: Dict[str, Any],
-        cfg_scale: float,
-        prefilled_outputs: Any,
-    ) -> Any:
-        """Run non-streaming generation with optional progress-bar suppression."""
-        progress_enabled = os.environ.get("VIBEVOICE_PROGRESS", "").lower() in {"1", "true", "yes"}
-        stderr_sink = nullcontext()
-        if not progress_enabled:
-            stderr_sink = open(os.devnull, "w", encoding="utf-8")
-
-        with stderr_sink as sink:
-            progress_context = nullcontext() if progress_enabled else redirect_stderr(sink)
-            with progress_context, torch.inference_mode():
-                return self.model.generate(
-                    **inputs,
-                    max_new_tokens=None,
-                    cfg_scale=cfg_scale,
-                    tokenizer=self.processor.tokenizer,
-                    generation_config={"do_sample": False},
-                    verbose=False,
-                    all_prefilled_outputs=copy.deepcopy(prefilled_outputs),
-                )
-
     def generate_speech(self, text: str, voice: str, cfg_scale: float = 1.5) -> np.ndarray:
         """Generate speech from text
 
@@ -476,25 +309,53 @@ class VibeVoiceTTSService:
         prefilled_outputs = self._get_voice_prompt(voice)
 
         # Clean text
-        text = text.strip().replace("\u2019", "'").replace("\u201c", '"').replace("\u201d", '"')
-        inputs = self._prepare_inputs(text, prefilled_outputs)
+        text = text.strip().replace("'", "'")
+
+        # Prepare inputs
+        inputs = self.processor.process_input_with_cached_prompt(
+            text=text,
+            cached_prompt=prefilled_outputs,
+            padding=True,
+            return_tensors="pt",
+            return_attention_mask=True,
+        )
+
+        # Move to device
+        for k, v in inputs.items():
+            if torch.is_tensor(v):
+                inputs[k] = v.to(self._torch_device)
 
         print(f"[tts] Generating speech for {len(text)} chars with voice '{voice}'")
         start_time = time.time()
 
         # Generate
-        outputs = self._run_full_generation(
-            inputs=inputs,
+        outputs = self.model.generate(
+            **inputs,
+            max_new_tokens=None,
             cfg_scale=cfg_scale,
-            prefilled_outputs=prefilled_outputs,
+            tokenizer=self.processor.tokenizer,
+            generation_config={"do_sample": False},
+            verbose=False,
+            all_prefilled_outputs=copy.deepcopy(prefilled_outputs),
         )
 
-        self._sync_device_for_timing()
         elapsed = time.time() - start_time
 
         # Extract audio
         if outputs.speech_outputs and outputs.speech_outputs[0] is not None:
-            audio = self._audio_to_numpy(outputs.speech_outputs[0])
+            audio = outputs.speech_outputs[0]
+            if torch.is_tensor(audio):
+                audio = audio.detach().cpu().to(torch.float32).numpy()
+            else:
+                audio = np.asarray(audio, dtype=np.float32)
+
+            if audio.ndim > 1:
+                audio = audio.reshape(-1)
+
+            # Normalize
+            peak = np.max(np.abs(audio))
+            if peak > 1.0:
+                audio = audio / peak
 
             duration = len(audio) / SAMPLE_RATE
             rtf = elapsed / duration if duration > 0 else float("inf")
@@ -503,58 +364,6 @@ class VibeVoiceTTSService:
             return audio
         else:
             raise RuntimeError("No audio output generated")
-
-    def stream_speech_pcm(self, text: str, voice: str, cfg_scale: float = 1.5) -> Iterator[bytes]:
-        """Generate speech and yield raw PCM16 chunks as soon as they are available."""
-        if not self.model or not self.processor:
-            raise RuntimeError("Model not loaded")
-
-        voice = self._resolve_voice(voice)
-        prefilled_outputs = self._get_voice_prompt(voice)
-        text = text.strip().replace("\u2019", "'").replace("\u201c", '"').replace("\u201d", '"')
-        inputs = self._prepare_inputs(text, prefilled_outputs)
-
-        print(f"[tts] Streaming speech for {len(text)} chars with voice '{voice}'")
-        audio_streamer = AudioStreamer(batch_size=1, stop_signal=None, timeout=None)
-        stop_event = threading.Event()
-        errors: List[BaseException] = []
-        start_time = time.time()
-        first_chunk_logged = False
-
-        thread = threading.Thread(
-            target=self._run_stream_generation,
-            kwargs={
-                "inputs": inputs,
-                "audio_streamer": audio_streamer,
-                "errors": errors,
-                "cfg_scale": cfg_scale,
-                "prefilled_outputs": prefilled_outputs,
-                "stop_event": stop_event,
-            },
-            daemon=True,
-        )
-        thread.start()
-
-        try:
-            for audio_chunk in audio_streamer.get_stream(0):
-                audio = self._audio_to_numpy(audio_chunk)
-                if audio.size == 0:
-                    continue
-
-                if not first_chunk_logged:
-                    first_chunk_logged = True
-                    first_chunk_ms = (time.time() - start_time) * 1000
-                    print(f"[tts] First PCM chunk ready in {first_chunk_ms:.0f} ms")
-
-                yield audio_to_pcm16(audio)
-
-            if errors:
-                raise RuntimeError(str(errors[0]))
-        finally:
-            stop_event.set()
-            audio_streamer.end()
-            if thread is not threading.current_thread():
-                thread.join(timeout=5)
 
 
 # ------------------------------------------------------------------------------
@@ -576,7 +385,8 @@ def convert_audio(audio: np.ndarray, format: str, sample_rate: int = SAMPLE_RATE
 
     if format == "pcm":
         # Raw PCM16 little-endian
-        return audio_to_pcm16(audio)
+        pcm = (np.clip(audio, -1.0, 1.0) * 32767).astype(np.int16)
+        return pcm.tobytes()
 
     if format == "wav":
         # Use scipy for WAV
@@ -590,7 +400,15 @@ def convert_audio(audio: np.ndarray, format: str, sample_rate: int = SAMPLE_RATE
     wavfile.write(wav_buffer, sample_rate, (np.clip(audio, -1.0, 1.0) * 32767).astype(np.int16))
     wav_data = wav_buffer.getvalue()
 
-    if format not in FFMPEG_FORMAT_ARGS:
+    # ffmpeg format mappings
+    format_args = {
+        "mp3": ["-f", "mp3", "-codec:a", "libmp3lame", "-q:a", "2"],
+        "opus": ["-f", "opus", "-codec:a", "libopus"],
+        "flac": ["-f", "flac", "-codec:a", "flac"],
+        "aac": ["-f", "adts", "-codec:a", "aac"],
+    }
+
+    if format not in format_args:
         raise ValueError(f"Unsupported format: {format}")
 
     # Run ffmpeg
@@ -600,7 +418,7 @@ def convert_audio(audio: np.ndarray, format: str, sample_rate: int = SAMPLE_RATE
         "-loglevel", "error",
         "-f", "wav",
         "-i", "pipe:0",
-        *FFMPEG_FORMAT_ARGS[format],
+        *format_args[format],
         "pipe:1"
     ]
 
@@ -617,86 +435,6 @@ def convert_audio(audio: np.ndarray, format: str, sample_rate: int = SAMPLE_RATE
         raise RuntimeError(f"Audio conversion failed: {e}")
     except FileNotFoundError:
         raise RuntimeError("ffmpeg not found. Please install ffmpeg.")
-
-
-def stream_encoded_audio(pcm_chunks: Iterator[bytes], format: str) -> Iterator[bytes]:
-    """Encode a PCM16 chunk stream with ffmpeg and yield encoded audio chunks."""
-    format = format.lower()
-    if format == "pcm":
-        yield from pcm_chunks
-        return
-
-    if format not in FFMPEG_FORMAT_ARGS:
-        raise ValueError(f"Streaming is not supported for format: {format}")
-
-    if shutil.which("ffmpeg") is None:
-        raise RuntimeError("ffmpeg not found. Please install ffmpeg.")
-
-    cmd = [
-        "ffmpeg",
-        "-hide_banner",
-        "-loglevel", "error",
-        "-f", "s16le",
-        "-ar", str(SAMPLE_RATE),
-        "-ac", "1",
-        "-i", "pipe:0",
-        *FFMPEG_FORMAT_ARGS[format],
-        "pipe:1",
-    ]
-
-    process = subprocess.Popen(
-        cmd,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        bufsize=0,
-    )
-    writer_errors: List[BaseException] = []
-
-    def write_input() -> None:
-        try:
-            assert process.stdin is not None
-            for chunk in pcm_chunks:
-                process.stdin.write(chunk)
-                process.stdin.flush()
-        except BaseException as exc:
-            writer_errors.append(exc)
-        finally:
-            try:
-                if process.stdin:
-                    process.stdin.close()
-            except Exception:
-                pass
-
-    writer = threading.Thread(target=write_input, daemon=True)
-    writer.start()
-
-    completed = False
-    try:
-        assert process.stdout is not None
-        while True:
-            chunk = process.stdout.read(16 * 1024)
-            if not chunk:
-                completed = True
-                break
-            yield chunk
-    finally:
-        if not completed and process.poll() is None:
-            process.terminate()
-        writer.join(timeout=5)
-
-    return_code = process.wait()
-    stderr = process.stderr.read() if process.stderr else b""
-    if writer_errors:
-        raise RuntimeError(str(writer_errors[0]))
-    if return_code != 0:
-        raise RuntimeError(f"ffmpeg failed: {stderr.decode(errors='replace')}")
-
-
-def audio_to_pcm16(audio: np.ndarray) -> bytes:
-    """Convert float32 mono audio samples to raw little-endian PCM16 bytes."""
-    pcm = (np.clip(audio, -1.0, 1.0) * 32767).astype(np.int16)
-    return pcm.tobytes()
 
 
 def get_content_type(format: str) -> str:
@@ -761,8 +499,7 @@ async def health_check():
         model_loaded=tts_service is not None and tts_service.model is not None,
         device=tts_service.device if tts_service else "unknown",
         features={
-            "streaming": True,
-            "streaming_formats": STREAMABLE_FORMATS,
+            "streaming": False,
             "formats": SUPPORTED_FORMATS,
             "sample_rate": SAMPLE_RATE,
         }
@@ -803,7 +540,7 @@ async def list_models():
 
 
 @app.post("/v1/audio/speech")
-def create_speech(request: TTSRequest):
+async def create_speech(request: TTSRequest):
     """Generate speech from text (OpenAI-compatible)"""
     if not tts_service:
         raise HTTPException(status_code=503, detail="Service not ready")
@@ -815,40 +552,13 @@ def create_speech(request: TTSRequest):
     if len(request.input) > 4096:
         raise HTTPException(status_code=400, detail="Input text exceeds 4096 characters")
 
-    response_format = request.response_format.lower()
-
-    if response_format not in SUPPORTED_FORMATS:
+    if request.response_format.lower() not in SUPPORTED_FORMATS:
         raise HTTPException(
             status_code=400,
             detail=f"Unsupported format. Supported: {SUPPORTED_FORMATS}"
         )
 
-    if request.stream and response_format not in STREAMABLE_FORMATS:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Streaming is currently supported only with: {STREAMABLE_FORMATS}"
-        )
-
     try:
-        if request.stream or response_format in STREAMABLE_FORMATS:
-            if response_format in FFMPEG_FORMAT_ARGS and shutil.which("ffmpeg") is None:
-                raise RuntimeError("ffmpeg not found. Please install ffmpeg.")
-
-            pcm_chunks = tts_service.stream_speech_pcm(
-                text=request.input,
-                voice=request.voice,
-                cfg_scale=CFG_SCALE,
-            )
-            audio_chunks = stream_encoded_audio(pcm_chunks, response_format)
-            return StreamingResponse(
-                audio_chunks,
-                media_type=get_content_type(response_format),
-                headers={
-                    "Cache-Control": "no-cache",
-                    "X-Accel-Buffering": "no",
-                },
-            )
-
         # Generate speech
         audio = tts_service.generate_speech(
             text=request.input,
@@ -857,14 +567,14 @@ def create_speech(request: TTSRequest):
         )
 
         # Convert to requested format
-        audio_bytes = convert_audio(audio, response_format)
-        content_type = get_content_type(response_format)
+        audio_bytes = convert_audio(audio, request.response_format)
+        content_type = get_content_type(request.response_format)
 
         return Response(
             content=audio_bytes,
             media_type=content_type,
             headers={
-                "Content-Disposition": f"attachment; filename=speech.{response_format}"
+                "Content-Disposition": f"attachment; filename=speech.{request.response_format}"
             }
         )
 
@@ -882,7 +592,7 @@ def main():
     parser.add_argument("--host", type=str, default="0.0.0.0", help="Host to bind")
     parser.add_argument("--port", type=int, default=8880, help="Port to bind")
     parser.add_argument("--model-path", type=str, default=DEFAULT_MODEL_PATH, help="Model path")
-    parser.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu", "mps"], help="Device")
+    parser.add_argument("--device", type=str, default="cuda", choices=["cuda", "cpu", "mps"], help="Device")
     parser.add_argument("--reload", action="store_true", help="Enable auto-reload")
     args = parser.parse_args()
 
