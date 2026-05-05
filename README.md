@@ -3,6 +3,9 @@
 ## Why fork?
 added streaming support!
 
+
+## Orginal readme
+
 OpenAI-compatible TTS API wrapping [VibeVoice-Realtime-0.5B](https://huggingface.co/microsoft/VibeVoice-Realtime-0.5B) for Open WebUI.
 
 ![image](assets/openwebui_settings.png)
