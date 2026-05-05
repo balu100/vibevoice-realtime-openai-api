@@ -56,6 +56,9 @@ DEFAULT_MODEL_PATH = "microsoft/VibeVoice-Realtime-0.5B"
 # CFG scale for generation (configurable via env var)
 CFG_SCALE = float(os.environ.get("CFG_SCALE", "1.25"))
 
+# Output volume gain. 1.0 is unchanged, 0.5 is half, 2.0 is louder.
+DEFAULT_VOLUME = float(os.environ.get("VIBEVOICE_VOLUME", os.environ.get("VOLUME", "1.0")))
+
 # Voices directory
 VOICES_DIR = MODELS_DIR / "voices"
 
@@ -140,6 +143,7 @@ class TTSRequest(BaseModel):
     instructions: Optional[str] = Field(default=None, description="Voice instructions (ignored)")
     response_format: str = Field(default="mp3", description="Audio format")
     speed: float = Field(default=1.0, description="Speed (not yet supported)")
+    volume: Optional[float] = Field(default=None, ge=0.0, le=4.0, description="Output volume gain")
     stream: bool = Field(default=False, description="Enable streaming response")
 
 
@@ -504,7 +508,7 @@ class VibeVoiceTTSService:
         else:
             raise RuntimeError("No audio output generated")
 
-    def stream_speech_pcm(self, text: str, voice: str, cfg_scale: float = 1.5) -> Iterator[bytes]:
+    def stream_speech_pcm(self, text: str, voice: str, cfg_scale: float = 1.5, volume: float = 1.0) -> Iterator[bytes]:
         """Generate speech and yield raw PCM16 chunks as soon as they are available."""
         if not self.model or not self.processor:
             raise RuntimeError("Model not loaded")
@@ -546,7 +550,7 @@ class VibeVoiceTTSService:
                     first_chunk_ms = (time.time() - start_time) * 1000
                     print(f"[tts] First PCM chunk ready in {first_chunk_ms:.0f} ms")
 
-                yield audio_to_pcm16(audio)
+                yield audio_to_pcm16(audio, volume=volume)
 
             if errors:
                 raise RuntimeError(str(errors[0]))
@@ -561,7 +565,7 @@ class VibeVoiceTTSService:
 # Audio Format Conversion
 # ------------------------------------------------------------------------------
 
-def convert_audio(audio: np.ndarray, format: str, sample_rate: int = SAMPLE_RATE) -> bytes:
+def convert_audio(audio: np.ndarray, format: str, sample_rate: int = SAMPLE_RATE, volume: float = 1.0) -> bytes:
     """Convert audio to specified format using ffmpeg
 
     Args:
@@ -576,18 +580,18 @@ def convert_audio(audio: np.ndarray, format: str, sample_rate: int = SAMPLE_RATE
 
     if format == "pcm":
         # Raw PCM16 little-endian
-        return audio_to_pcm16(audio)
+        return audio_to_pcm16(audio, volume=volume)
 
     if format == "wav":
         # Use scipy for WAV
         buffer = io.BytesIO()
-        wavfile.write(buffer, sample_rate, (np.clip(audio, -1.0, 1.0) * 32767).astype(np.int16))
+        wavfile.write(buffer, sample_rate, audio_to_pcm16_array(audio, volume=volume))
         return buffer.getvalue()
 
     # Use ffmpeg for other formats
     # Prepare input WAV
     wav_buffer = io.BytesIO()
-    wavfile.write(wav_buffer, sample_rate, (np.clip(audio, -1.0, 1.0) * 32767).astype(np.int16))
+    wavfile.write(wav_buffer, sample_rate, audio_to_pcm16_array(audio, volume=volume))
     wav_data = wav_buffer.getvalue()
 
     if format not in FFMPEG_FORMAT_ARGS:
@@ -693,10 +697,22 @@ def stream_encoded_audio(pcm_chunks: Iterator[bytes], format: str) -> Iterator[b
         raise RuntimeError(f"ffmpeg failed: {stderr.decode(errors='replace')}")
 
 
-def audio_to_pcm16(audio: np.ndarray) -> bytes:
+def audio_to_pcm16_array(audio: np.ndarray, volume: float = 1.0) -> np.ndarray:
+    """Convert float32 mono audio samples to clipped PCM16 samples."""
+    safe_volume = max(0.0, min(float(volume), 4.0))
+    return (np.clip(audio * safe_volume, -1.0, 1.0) * 32767).astype(np.int16)
+
+
+def audio_to_pcm16(audio: np.ndarray, volume: float = 1.0) -> bytes:
     """Convert float32 mono audio samples to raw little-endian PCM16 bytes."""
-    pcm = (np.clip(audio, -1.0, 1.0) * 32767).astype(np.int16)
-    return pcm.tobytes()
+    return audio_to_pcm16_array(audio, volume=volume).tobytes()
+
+
+def resolve_volume(requested_volume: Optional[float]) -> float:
+    """Resolve request volume against env default and clamp to a safe range."""
+    if requested_volume is None:
+        requested_volume = DEFAULT_VOLUME
+    return max(0.0, min(float(requested_volume), 4.0))
 
 
 def get_content_type(format: str) -> str:
@@ -765,6 +781,7 @@ async def health_check():
             "streaming_formats": STREAMABLE_FORMATS,
             "formats": SUPPORTED_FORMATS,
             "sample_rate": SAMPLE_RATE,
+            "default_volume": DEFAULT_VOLUME,
         }
     )
 
@@ -816,6 +833,7 @@ def create_speech(request: TTSRequest):
         raise HTTPException(status_code=400, detail="Input text exceeds 4096 characters")
 
     response_format = request.response_format.lower()
+    volume = resolve_volume(request.volume)
 
     if response_format not in SUPPORTED_FORMATS:
         raise HTTPException(
@@ -838,6 +856,7 @@ def create_speech(request: TTSRequest):
                 text=request.input,
                 voice=request.voice,
                 cfg_scale=CFG_SCALE,
+                volume=volume,
             )
             audio_chunks = stream_encoded_audio(pcm_chunks, response_format)
             return StreamingResponse(
@@ -857,7 +876,7 @@ def create_speech(request: TTSRequest):
         )
 
         # Convert to requested format
-        audio_bytes = convert_audio(audio, response_format)
+        audio_bytes = convert_audio(audio, response_format, volume=volume)
         content_type = get_content_type(response_format)
 
         return Response(
