@@ -10,7 +10,7 @@ services:
       - ./vibevoice_realtime_openai_api.py:/home/ubuntu/app/vibevoice_realtime_openai_api.py:ro
     environment:
       - CFG_SCALE=1.25  # (0.0 - 3.0, higher = more expressive)
-      - VIBEVOICE_VOLUME=3
+      - default_volume_multiplier=3.0
     deploy:
       resources:
         reservations:

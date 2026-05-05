@@ -57,7 +57,10 @@ DEFAULT_MODEL_PATH = "microsoft/VibeVoice-Realtime-0.5B"
 CFG_SCALE = float(os.environ.get("CFG_SCALE", "1.25"))
 
 # Output volume gain. 1.0 is unchanged, 0.5 is half, 2.0 is louder.
-DEFAULT_VOLUME = float(os.environ.get("VIBEVOICE_VOLUME", os.environ.get("VOLUME", "1.0")))
+DEFAULT_VOLUME = float(os.environ.get(
+    "VIBEVOICE_VOLUME",
+    os.environ.get("DEFAULT_VOLUME_MULTIPLIER", os.environ.get("VOLUME", "1.0"))
+))
 
 # Voices directory
 VOICES_DIR = MODELS_DIR / "voices"
@@ -144,6 +147,7 @@ class TTSRequest(BaseModel):
     response_format: str = Field(default="mp3", description="Audio format")
     speed: float = Field(default=1.0, description="Speed (not yet supported)")
     volume: Optional[float] = Field(default=None, ge=0.0, le=4.0, description="Output volume gain")
+    volume_multiplier: Optional[float] = Field(default=None, ge=0.0, le=4.0, description="Output volume gain")
     stream: bool = Field(default=False, description="Enable streaming response")
 
 
@@ -708,9 +712,11 @@ def audio_to_pcm16(audio: np.ndarray, volume: float = 1.0) -> bytes:
     return audio_to_pcm16_array(audio, volume=volume).tobytes()
 
 
-def resolve_volume(requested_volume: Optional[float]) -> float:
+def resolve_volume(requested_volume: Optional[float], requested_multiplier: Optional[float]) -> float:
     """Resolve request volume against env default and clamp to a safe range."""
-    if requested_volume is None:
+    if requested_volume is None and requested_multiplier is not None:
+        requested_volume = requested_multiplier
+    elif requested_volume is None:
         requested_volume = DEFAULT_VOLUME
     return max(0.0, min(float(requested_volume), 4.0))
 
@@ -833,7 +839,7 @@ def create_speech(request: TTSRequest):
         raise HTTPException(status_code=400, detail="Input text exceeds 4096 characters")
 
     response_format = request.response_format.lower()
-    volume = resolve_volume(request.volume)
+    volume = resolve_volume(request.volume, request.volume_multiplier)
 
     if response_format not in SUPPORTED_FORMATS:
         raise HTTPException(
