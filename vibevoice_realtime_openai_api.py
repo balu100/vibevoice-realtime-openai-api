@@ -59,7 +59,13 @@ CFG_SCALE = float(os.environ.get("CFG_SCALE", "1.25"))
 # Output volume gain. 1.0 is unchanged, 0.5 is half, 2.0 is louder.
 DEFAULT_VOLUME = float(os.environ.get(
     "VIBEVOICE_VOLUME",
-    os.environ.get("DEFAULT_VOLUME_MULTIPLIER", os.environ.get("VOLUME", "1.0"))
+    os.environ.get(
+        "DEFAULT_VOLUME_MULTIPLIER",
+        os.environ.get(
+            "default_volume_multiplier",
+            os.environ.get("volume_multiplier", os.environ.get("VOLUME", "1.0"))
+        )
+    )
 ))
 
 # Voices directory
